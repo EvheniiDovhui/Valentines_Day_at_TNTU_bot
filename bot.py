@@ -221,7 +221,7 @@ async def process_anon(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer("✅ <b>Валентинку доставлено!</b>", parse_mode="HTML", reply_markup=get_main_kb())
-    await message.answer("🚀")
+    await message.answer("💘")
 
 async def main():
     init_db()
