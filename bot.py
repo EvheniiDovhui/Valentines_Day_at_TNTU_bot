@@ -2,7 +2,7 @@ import asyncio
 import psycopg2
 import logging
 import os
-from aiohttp import web # Додаємо для Render
+from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -19,22 +19,20 @@ logging.basicConfig(level=logging.INFO)
 
 TEMPLATES = ["Ти мені подобаєшся! ❤️", "Дякую, що ти є! ✨", "З Днем Валентина! 💘"]
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (ФІКС ПОРТУ) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (ЩОБ НЕ БУЛО PORT TIMEOUT) ---
 async def handle(request):
-    return web.Response(text="Bot is alive!")
+    return web.Response(text="Bot is running!")
 
 async def run_http_server():
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render автоматично надає порт у змінній оточення PORT
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logging.info(f"HTTP server started on port {port}")
 
-# --- БАЗА ДАНИХ ---
+# --- БАЗА ДАНИХ (NEON) ---
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
@@ -65,9 +63,9 @@ def get_main_kb():
     kb.adjust(1)
     return kb.as_markup(resize_keyboard=True)
 
-# --- ОБРОБНИКИ (POSTGRES) ---
+# --- ОБРОБНИКИ (БЕЗ ПАРАМЕТРА STATE В ДЕКОРАТОРАХ) ---
 
-@dp.message(F.text == "Моя пошта 📮", state="*")
+@dp.message(F.text == "Моя пошта 📮")
 async def check_mail(message: types.Message, state: FSMContext):
     await state.clear()
     username = message.from_user.username.lower() if message.from_user.username else None
@@ -88,16 +86,16 @@ async def check_mail(message: types.Message, state: FSMContext):
         await message.answer("Твоя пошта порожня... ✨", reply_markup=get_main_kb())
     else:
         for content, c_type, anon, name, s_username in mails:
-            sender_label = "Таємний шанувальник 👤" if anon else f"Від: {name} ✍️"
+            label = "Таємний шанувальник 👤" if anon else f"Від: {name} ✍️"
             builder = InlineKeyboardBuilder()
             if not anon and s_username:
                 builder.button(text=f"Відповісти @{s_username}", callback_data=f"reply_{s_username}")
             
             if c_type == "sticker":
-                await message.answer(f"<b>{sender_label}</b>:", parse_mode="HTML")
+                await message.answer(f"<b>{label}</b>:", parse_mode="HTML")
                 await message.answer_sticker(content, reply_markup=builder.as_markup())
             else:
-                await message.answer(f"<b>{sender_label}</b>:\n<tg-spoiler>{content}</tg-spoiler>", 
+                await message.answer(f"<b>{label}</b>:\n<tg-spoiler>{content}</tg-spoiler>", 
                                      parse_mode="HTML", reply_markup=builder.as_markup())
     cursor.close()
     conn.close()
@@ -123,8 +121,6 @@ async def cmd_start(message: types.Message):
     cursor.close()
     conn.close()
     await message.answer("❤️ Вітаємо в Пошті Амура ТНТУ!", reply_markup=get_main_kb())
-
-# --- ЛОГІКА ВІДПРАВКИ ---
 
 @dp.message(F.text == "Надіслати валентинку 💌")
 async def start_sending(message: types.Message, state: FSMContext):
@@ -176,7 +172,7 @@ async def process_anon(message: types.Message, state: FSMContext):
     
     if receiver_data:
         try:
-            await bot.send_message(receiver_data[0], "✨ Тобі прийшла нова валентинка! 📮\n💘")
+            await bot.send_message(receiver_data[0], "✨ Тобі нова валентинка! 📮\n💘")
         except: pass
 
     cursor.close()
@@ -186,9 +182,7 @@ async def process_anon(message: types.Message, state: FSMContext):
 
 async def main():
     init_db()
-    # Запускаємо веб-сервер фоном
     await run_http_server()
-    # Запускаємо бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
