@@ -2,6 +2,7 @@ import asyncio
 import psycopg2
 import logging
 import os
+import random
 from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -17,11 +18,69 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 logging.basicConfig(level=logging.INFO)
 
-TEMPLATES = ["Ти мені подобаєшся! ❤️", "Дякую, що ти є! ✨", "З Днем Валентина! 💘"]
+# --- СТАНИ (FSM) ---
+class SendValentine(StatesGroup):
+    waiting_for_receiver = State()
+    waiting_for_message = State()
+    waiting_for_anon = State()
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (ЩОБ НЕ БУЛО PORT TIMEOUT) ---
+class ChatRoulette(StatesGroup):
+    in_chat = State()
+
+# --- ПЕРЕДБАЧЕННЯ ---
+PREDICTIONS = [
+    "Сьогодні ти зустрінеш свою долю в 2-му корпусі ТНТУ! ✨",
+    "Твій таємний шанувальник поставить лайк на твій наступний сторіз. ❤️",
+    "Амур каже: час надіслати валентинку тій самій людині... 😉",
+    "Твоє кохання сильніше, ніж черга в їдальні ТНТУ! 🍕",
+    "Сьогодні ідеальний день для кави з кимось особливим. ☕",
+    "Хтось мріє отримати від тебе повідомлення прямо зараз. 💌",
+    "Твій інтелект сьогодні — твоя найсексуальніша риса! 🧠🔥",
+    "Сесія пройде легко, якщо в серці буде кохання! 📚❤️"
+]
+
+# --- БАЗА ДАНИХ (NEON / POSTGRESQL) ---
+def get_db_connection():
+    url = DATABASE_URL
+    if url and url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url)
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Користувачі
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, full_name TEXT)")
+    # Валентинки
+    cursor.execute("""CREATE TABLE IF NOT EXISTS valentines (
+        id SERIAL PRIMARY KEY, sender_id BIGINT, receiver_username TEXT, 
+        content TEXT, content_type TEXT, is_anonymous INTEGER)""")
+    # Чат-рулетка
+    cursor.execute("CREATE TABLE IF NOT EXISTS active_chats (user1 BIGINT PRIMARY KEY, user2 BIGINT)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS queue (user_id BIGINT PRIMARY KEY)")
+    # Очистка тимчасових даних при перезапуску
+    cursor.execute("DELETE FROM queue")
+    cursor.execute("DELETE FROM active_chats")
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
+
+# --- КЛАВІАТУРИ ---
+def get_main_kb():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="Надіслати валентинку 💌")
+    kb.button(text="Моя пошта 📮")
+    kb.button(text="Випадковий чат 🎲")
+    kb.button(text="Передбачення Амура ✨")
+    kb.adjust(2)
+    return kb.as_markup(resize_keyboard=True)
+
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def handle(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Амур ТНТУ в мережі! ❤️")
 
 async def run_http_server():
     app = web.Application()
@@ -32,48 +91,120 @@ async def run_http_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# --- БАЗА ДАНИХ (NEON) ---
-def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
+# --- ОБРОБНИКИ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username.lower() if message.from_user.username else None
+    
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, full_name TEXT)")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS valentines (
-        id SERIAL PRIMARY KEY, 
-        sender_id BIGINT, 
-        receiver_username TEXT, 
-        content TEXT, 
-        content_type TEXT,
-        is_anonymous INTEGER)""")
+    cursor.execute("INSERT INTO users (user_id, username, full_name) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", 
+                   (user_id, username, message.from_user.full_name))
     conn.commit()
     cursor.close()
     conn.close()
 
-class SendValentine(StatesGroup):
-    waiting_for_receiver = State()
-    waiting_for_message = State()
-    waiting_for_anon = State()
+    await message.answer(
+        f"Привіт, {message.from_user.first_name}! 👋\n\n"
+        "Вітаємо у **Пошті Амура ТНТУ**! 🏹\n"
+        "Тут ти можеш надсилати валентинки, спілкуватися в анонімному чаті та отримувати передбачення.\n\n"
+        "Обирай дію 👇", 
+        parse_mode="Markdown", reply_markup=get_main_kb()
+    )
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+# --- ЛОГІКА ЧАТ-РУЛЕТКИ (ВАУ-ФІЧА) ---
+@dp.message(F.text == "Випадковий чат 🎲")
+async def start_roulette(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-def get_main_kb():
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="Надіслати валентинку 💌")
-    kb.button(text="Моя пошта 📮")
-    kb.adjust(1)
-    return kb.as_markup(resize_keyboard=True)
+    # Шукаємо вільну людину
+    cursor.execute("SELECT user_id FROM queue WHERE user_id != %s LIMIT 1", (user_id,))
+    partner = cursor.fetchone()
 
-# --- ОБРОБНИКИ (БЕЗ ПАРАМЕТРА STATE В ДЕКОРАТОРАХ) ---
+    if partner:
+        partner_id = partner[0]
+        cursor.execute("DELETE FROM queue WHERE user_id = %s", (partner_id,))
+        cursor.execute("INSERT INTO active_chats (user1, user2) VALUES (%s, %s)", (user_id, partner_id))
+        conn.commit()
+        
+        await state.set_state(ChatRoulette.in_chat)
+        await state.update_data(partner_id=partner_id)
+        
+        partner_state = dp.fsm.get_context(bot, user_id=partner_id, chat_id=partner_id)
+        await partner_state.set_state(ChatRoulette.in_chat)
+        await partner_state.update_data(partner_id=user_id)
+
+        msg = "💎 Пару знайдено! Ви спілкуєтесь анонімно.\nНапиши /stop щоб вийти."
+        await message.answer(msg, reply_markup=ReplyKeyboardBuilder().button(text="/stop").as_markup(resize_keyboard=True))
+        await bot.send_message(partner_id, msg, reply_markup=ReplyKeyboardBuilder().button(text="/stop").as_markup(resize_keyboard=True))
+    else:
+        cursor.execute("INSERT INTO queue (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+        conn.commit()
+        await message.answer("Шукаю тобі пару... 🔍", reply_markup=ReplyKeyboardBuilder().button(text="Скасувати пошук ❌").as_markup(resize_keyboard=True))
+    
+    cursor.close()
+    conn.close()
+
+@dp.message(ChatRoulette.in_chat, Command("stop"))
+@dp.message(ChatRoulette.in_chat, F.text == "/stop")
+async def stop_chat(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    partner_id = data.get("partner_id")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM active_chats WHERE user1 = %s OR user2 = %s", (message.from_user.id, message.from_user.id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    await state.clear()
+    await message.answer("Чат завершено ❤️", reply_markup=get_main_kb())
+    
+    if partner_id:
+        p_state = dp.fsm.get_context(bot, user_id=partner_id, chat_id=partner_id)
+        await p_state.clear()
+        try:
+            await bot.send_message(partner_id, "Співрозмовник завершив чат. ✨", reply_markup=get_main_kb())
+        except: pass
+
+@dp.message(ChatRoulette.in_chat)
+async def chat_messages(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    p_id = data.get("partner_id")
+    if p_id:
+        try:
+            if message.text: await bot.send_message(p_id, f"👤: {message.text}")
+            elif message.sticker: await bot.send_sticker(p_id, message.sticker.file_id)
+        except: await message.answer("Не вдалося надіслати.")
+
+@dp.message(F.text == "Скасувати пошук ❌")
+async def cancel_search(message: types.Message):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM queue WHERE user_id = %s", (message.from_user.id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    await message.answer("Пошук скасовано.", reply_markup=get_main_kb())
+
+# --- ВАЛЕНТИНКИ ТА ІНШЕ ---
+@dp.message(F.text == "Передбачення Амура ✨")
+async def get_prediction(message: types.Message):
+    await message.answer(f"🔮 **Твоє передбачення:**\n\n_{random.choice(PREDICTIONS)}_", parse_mode="Markdown")
 
 @dp.message(F.text == "Моя пошта 📮")
 async def check_mail(message: types.Message, state: FSMContext):
-    await state.clear()
     username = message.from_user.username.lower() if message.from_user.username else None
     if not username:
-        await message.answer("❌ Встанови @username!")
+        await message.answer("❌ Встанови @username в налаштуваннях!")
         return
 
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT v.content, v.content_type, v.is_anonymous, u.full_name, u.username 
@@ -83,102 +214,66 @@ async def check_mail(message: types.Message, state: FSMContext):
     mails = cursor.fetchall()
     
     if not mails:
-        await message.answer("Твоя пошта порожня... ✨", reply_markup=get_main_kb())
+        await message.answer("Пошта порожня... ✨", reply_markup=get_main_kb())
     else:
         for content, c_type, anon, name, s_username in mails:
-            label = "Таємний шанувальник 👤" if anon else f"Від: {name} ✍️"
-            builder = InlineKeyboardBuilder()
-            if not anon and s_username:
-                builder.button(text=f"Відповісти @{s_username}", callback_data=f"reply_{s_username}")
+            label = "🎭 Таємний шанувальник" if anon else f"✍️ Від: {name}"
+            kb = InlineKeyboardBuilder()
+            if not anon and s_username: kb.button(text="Відповісти 💌", callback_data=f"reply_{s_username}")
             
             if c_type == "sticker":
                 await message.answer(f"<b>{label}</b>:", parse_mode="HTML")
-                await message.answer_sticker(content, reply_markup=builder.as_markup())
+                await message.answer_sticker(content, reply_markup=kb.as_markup())
             else:
-                await message.answer(f"<b>{label}</b>:\n<tg-spoiler>{content}</tg-spoiler>", 
-                                     parse_mode="HTML", reply_markup=builder.as_markup())
+                await message.answer(f"<b>{label}</b>:\n<tg-spoiler>{content}</tg-spoiler>", parse_mode="HTML", reply_markup=kb.as_markup())
     cursor.close()
     conn.close()
-
-@dp.callback_query(F.data.startswith("reply_"))
-async def handle_reply(callback: types.CallbackQuery, state: FSMContext):
-    target = callback.data.replace("reply_", "")
-    await state.clear()
-    await state.update_data(receiver=target)
-    await state.set_state(SendValentine.waiting_for_message)
-    await callback.message.answer(f"Пишемо відповідь для @{target}:")
-    await callback.answer()
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    username = message.from_user.username.lower() if message.from_user.username else None
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (user_id, username, full_name) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", 
-                   (user_id, username, message.from_user.full_name))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    await message.answer("❤️ Вітаємо в Пошті Амура ТНТУ!", reply_markup=get_main_kb())
 
 @dp.message(F.text == "Надіслати валентинку 💌")
-async def start_sending(message: types.Message, state: FSMContext):
+async def start_val(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Введи @username отримувача:")
+    await message.answer("📝 Введи **@username** отримувача:", parse_mode="Markdown")
     await state.set_state(SendValentine.waiting_for_receiver)
 
 @dp.message(SendValentine.waiting_for_receiver)
-async def process_receiver(message: types.Message, state: FSMContext):
-    if message.text == "Моя пошта 📮":
-        await check_mail(message, state)
-        return
-    receiver = message.text.replace("@", "").lower().strip()
-    await state.update_data(receiver=receiver)
+async def process_rec(message: types.Message, state: FSMContext):
+    if message.text in ["Моя пошта 📮", "Випадковий чат 🎲"]: return
+    await state.update_data(receiver=message.text.replace("@", "").lower().strip())
     await message.answer("Напиши текст або надішли стікер:")
     await state.set_state(SendValentine.waiting_for_message)
 
 @dp.message(SendValentine.waiting_for_message)
-async def process_content(message: types.Message, state: FSMContext):
-    if message.text == "Моя пошта 📮":
-        await check_mail(message, state)
-        return
+async def process_msg(message: types.Message, state: FSMContext):
     c_type = "sticker" if message.sticker else "text"
     content = message.sticker.file_id if message.sticker else message.text
     await state.update_data(content=content, type=c_type)
-    
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="Анонімно 🔒")
-    kb.button(text="Підписатися ✍️")
+    kb = ReplyKeyboardBuilder().button(text="Анонімно 🔒").button(text="Підписатися ✍️")
     await message.answer("Як надіслати?", reply_markup=kb.as_markup(resize_keyboard=True))
     await state.set_state(SendValentine.waiting_for_anon)
 
 @dp.message(SendValentine.waiting_for_anon)
-async def process_anon(message: types.Message, state: FSMContext):
-    if message.text == "Моя пошта 📮":
-        await check_mail(message, state)
-        return
+async def process_fin(message: types.Message, state: FSMContext):
     is_anon = 1 if "Анонімно" in message.text else 0
     data = await state.get_data()
-    
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
+    conn = get_db_connection(); cursor = conn.cursor()
     cursor.execute("INSERT INTO valentines (sender_id, receiver_username, content, content_type, is_anonymous) VALUES (%s, %s, %s, %s, %s)",
                    (message.from_user.id, data['receiver'], data['content'], data['type'], is_anon))
-    
     cursor.execute("SELECT user_id FROM users WHERE username = %s", (data['receiver'],))
-    receiver_data = cursor.fetchone()
-    conn.commit()
-    
-    if receiver_data:
-        try:
-            await bot.send_message(receiver_data[0], "✨ Тобі нова валентинка! 📮\n💘")
+    rec = cursor.fetchone()
+    conn.commit(); cursor.close(); conn.close()
+    if rec:
+        try: await bot.send_message(rec[0], "💘 Тобі прийшла валентинка! Перевір пошту 📮")
         except: pass
-
-    cursor.close()
-    conn.close()
     await state.clear()
-    await message.answer("✅ Доставлено!", reply_markup=get_main_kb())
+    await message.answer("🚀 Доставлено!", reply_markup=get_main_kb())
+
+@dp.message(Command("stats"))
+async def get_stats(message: types.Message):
+    conn = get_db_connection(); cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM valentines"); v = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM users"); u = cursor.fetchone()[0]
+    cursor.close(); conn.close()
+    await message.answer(f"📊 ❤️ Валентинок: {v} | 👥 Студентів: {u}")
 
 async def main():
     init_db()
