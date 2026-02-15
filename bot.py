@@ -7,6 +7,8 @@ import re
 from aiohttp import web
 from dotenv import load_dotenv
 
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramAPIError
+
 # Імпорт наших модулів
 from config import PREDICTIONS
 from utils import censor_text
@@ -21,7 +23,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 load_dotenv(dotenv_path="api.env")
 API_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
+TELEGRAM_ME_ID = os.getenv("TELEGRAM_ME_ID")
 logging.basicConfig(level=logging.INFO)
 
 # --- СТАНИ (FSM) ---
@@ -60,6 +62,7 @@ def init_db():
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
+BOT_ACTIVE = False  # Постав False, якщо хочеш вимкнути бота
 
 def get_main_kb():
     kb = ReplyKeyboardBuilder()
@@ -71,10 +74,20 @@ def get_main_kb():
     kb.adjust(2, 2, 1) # Групуємо кнопки: 2 в ряд, 2 в ряд і 1 внизу
     return kb.as_markup(resize_keyboard=True)
 
-# --- ОБРОБНИКИ КОМАНД ---
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
+    # ПЕРЕВІРКА АКТИВНОСТІ
+    if not BOT_ACTIVE:
+        await message.answer(
+            "👋 <b>Дякуємо!</b>\n\nПошта Амура ТНТУ завершила свою роботу цього сезону. "
+            "Ми вже готуємо стріли на наступний рік! 🏹\n\n"
+            "Бот знову запрацює до наступного <b>Дня святого Валентина</b>. До зустрічі! ❤️",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove() # Прибираємо старі кнопки, щоб не плутати
+        )
+        return
+
+    # Твоя звичайна логіка (якщо бот активний)
     user_id = message.from_user.id
     un = message.from_user.username.lower() if message.from_user.username else None
     
@@ -332,6 +345,64 @@ async def show_stats(message: types.Message):
         "Приєднуйся до спілкування! ❤️"
     )
     await message.answer(stats_text, parse_mode="HTML")
+
+@dp.message(Command("broadcast_end"))
+async def broadcast_finish(message: types.Message):
+    if message.from_user.id != TELEGRAM_ME_ID:
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    cursor.close(); conn.close()
+
+    count = 0
+    blocked_count = 0
+    
+    await message.answer(f"🚀 Починаю розсилку для {len(users)} людей...")
+
+    for user in users:
+        user_id = user[0]
+        try:
+            await bot.send_message(
+                user[0], 
+                "❤️ <b>Пошта Амура ТНТУ завершує свою роботу цього року!</b>\n\n"
+                "Дякуємо, що були з нами, надсилали валентинки та знаходили нові знайомства. "
+                "Бот іде на відпочинок, але рівно за рік, на наступний День святого Валентина, "
+                "ми знову відкриємо наші двері для ваших палких сердець! 🏹\n\n"
+                "До зустрічі у 2027 році! ✨",
+                parse_mode="HTML"
+            )
+            count += 1
+            # Чекаємо 0.05 сек (20 повідомлень на секунду), щоб не отримати бан за спам
+            await asyncio.sleep(0.05) 
+
+        except TelegramForbiddenError:
+            # Юзер заблокував бота
+            blocked_count += 1
+            logging.warning(f"Користувач {user_id} заблокував бота.")
+            
+        except TelegramRetryAfter as e:
+            # Якщо Telegram просить зачекати (флуд-контроль)
+            logging.error(f"Флуд-ліміт! Чекаємо {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            # Можна спробувати надіслати ще раз після очікування
+            
+        except TelegramAPIError as e:
+            # Будь-яка інша помилка Telegram (наприклад, юзера не існує)
+            logging.error(f"Помилка API для {user_id}: {e}")
+            
+        except Exception as e:
+            # Всі інші помилки (наприклад, проблеми з мережею)
+            logging.error(f"Непередбачена помилка для {user_id}: {e}")
+
+    await message.answer(
+        f"✅ <b>Розсилка завершена!</b>\n\n"
+        f"📥 Отримали: {count}\n"
+        f"🚫 Заблокували: {blocked_count}",
+        parse_mode="HTML"
+    )
 
 async def main():
     init_db()
